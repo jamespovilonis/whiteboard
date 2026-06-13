@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Whiteboard</title>
+    <link rel="stylesheet" href="styles.css">
+    <script src="whiteboard.js" defer></script>
+</head>
+<body>
+    <div class="canvas-container">
+        <canvas id="whiteboard"></canvas>
+        <div class="toolbar" role="toolbar" aria-label="Drawing tools">
+            <span class="toolbar-toggle" aria-hidden="true"><img src="icons/pencil.png" alt="" class="tool-icon"></span>
+            <div class="toolbar-content">
+                <button id="mouse" class="tool-btn" title="Mouse (M)" aria-label="Pan tool"><img src="icons/cursor.png" alt="Pan tool" class="tool-icon"></button>
+                <button id="pen" class="tool-btn active" title="Pen (P)" aria-label="Pen tool"><img src="icons/pencil.png" alt="Pen tool" class="tool-icon"></button>
+                <button id="eraser" class="tool-btn" title="Eraser (E)" aria-label="Eraser tool"><img src="icons/eraser.png" alt="Eraser tool" class="tool-icon"></button>
+                <div class="toolbar-divider" role="separator"></div>
+                <input type="color" id="colorPicker" value="#000000" title="Color" aria-label="Stroke color">
+                <input type="range" id="sizePicker" min="1" max="50" value="5" title="Brush size" aria-label="Brush size">
+                <span id="sizeValue" aria-live="polite">5</span>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
