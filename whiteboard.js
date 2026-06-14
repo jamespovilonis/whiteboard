@@ -1,11 +1,16 @@
 const TOOLS = { MOUSE: 'mouse', PEN: 'pen', ERASER: 'eraser' };
 const MAX_STROKES = 500;
+const SMOOTHING_STEPS = 12;        // subdivisions per segment (lower now since INTERP_STEP is small; 10–15 is enough for smoothness)
+const INTERP_STEP = 4;             // pixel spacing between stored points during live drawing (lower = more points, smoother curves)
+const TENSION = 0.1;              // Catmull-Rom tension: 0 = loose/round, 1 = tight/angular
+const VELOCITY_IMPACT = 0.40;     // ±20% width variation based on velocity (ink-like effect)
+const REF_SPEED = 50;             // reference speed in px per event for normalizing velocity in live drawing
 
 // ---- Standalone utility functions ----
 
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 
-function interpolatePoints(fromX, fromY, toX, toY, stepSize) {
+function interpolatePoints(fromX, fromY, toX, toY, stepSize, rawVelocity = 0) {
     const distance = Math.sqrt((toX - fromX) ** 2 + (toY - fromY) ** 2);
     const steps = Math.max(1, Math.ceil(distance / stepSize));
     const points = [];
@@ -14,22 +19,175 @@ function interpolatePoints(fromX, fromY, toX, toY, stepSize) {
         points.push({
             x: fromX + (toX - fromX) * t,
             y: fromY + (toY - fromY) * t,
+            velocity: rawVelocity,
         });
     }
     return points;
 }
 
-// Shared quadratic-bezier path rendering (used by both live drawing and stroke replay)
+// Evaluate a Catmull-Rom spline segment between p1 and p2 at parameter t in [0,1].
+// Uses p0 and p3 as preceding/following control points for smooth tangent calculation.
+// Tension controls how tightly the curve hugs the control polygon.
+function catmullRomPoint(p0, p1, p2, p3, t, tension) {
+    const t2 = t * t;
+    const t3 = t2 * t;
+
+    const s = (1 - tension) / 2;
+
+    // Catmull-Rom basis matrix coefficients
+    const h1 =  2 * t3 - 3 * t2 + 1;
+    const h2 = -2 * t3 + 3 * t2;
+    const h3 =      t3 - 2 * t2 + t;
+    const h4 =      t3 -     t2;
+
+    return {
+        x: h1 * p1.x + h2 * p2.x + s * (h3 * (p2.x - p0.x) + h4 * (p3.x - p1.x)),
+        y: h1 * p1.y + h2 * p2.y + s * (h3 * (p2.y - p0.y) + h4 * (p3.y - p1.y)),
+    };
+}
+
+function getSplineControls(points, index) {
+    return {
+        p0: index === 0
+            ? { x: 2 * points[0].x - points[1].x, y: 2 * points[0].y - points[1].y, velocity: points[0].velocity }
+            : points[index - 1],
+        p1: points[index],
+        p2: points[index + 1],
+        p3: index >= points.length - 2
+            ? {
+                x: 2 * points[points.length - 1].x - points[points.length - 2].x,
+                y: 2 * points[points.length - 1].y - points[points.length - 2].y,
+                velocity: points[points.length - 1].velocity,
+            }
+            : points[index + 2],
+    };
+}
+
+function sampleSplinePoints(points, steps = SMOOTHING_STEPS) {
+    if (points.length < 2) return points.slice();
+
+    const samples = [{ ...points[0] }];
+    for (let i = 0; i < points.length - 1; i++) {
+        const { p0, p1, p2, p3 } = getSplineControls(points, i);
+        const v1 = p1.velocity !== undefined ? p1.velocity : 0;
+        const v2 = p2.velocity !== undefined ? p2.velocity : v1;
+
+        for (let step = 1; step <= steps; step++) {
+            const t = step / steps;
+            const pt = catmullRomPoint(p0, p1, p2, p3, t, TENSION);
+            samples.push({
+                x: pt.x,
+                y: pt.y,
+                velocity: v1 + (v2 - v1) * t,
+            });
+        }
+    }
+
+    return samples;
+}
+
+// Compute the velocity-normalized width multiplier for a given velocity.
+function velocityWidthMultiplier(velocity, minVel, maxVel, baseSize) {
+    const velRange = maxVel - minVel;
+    // Normalize: 0 = slowest (thickest), 1 = fastest (thinnest)
+    const normalized = velRange === 0 ? 0 : clamp((velocity - minVel) / velRange, 0, 1);
+    // Slow → +20%, fast → -20%
+    return baseSize * (1 + VELOCITY_IMPACT * (1 - normalized));
+}
+
+// Group consecutive spline-sample segments whose widths are within WIDTH_TOLERANCE
+// into a single continuous sub-path, avoiding the overlapping-round-cap pixelation
+// that occurs when every segment is stroked individually.
+const WIDTH_TOLERANCE = 0.4;       // if widths differ by less than this, they are drawn as one smooth sub-path
+
+// Render a Catmull-Rom spline with per-segment variable width based on velocity.
+// Each segment between adjacent points gets its own lineWidth computed from
+// the average velocity of its endpoints.
+function drawVariableWidthPath(ctx, points, baseSize) {
+    if (points.length < 2) return;
+
+    const smoothPoints = sampleSplinePoints(points);
+
+    // Find velocity range across the entire stroke
+    let minVel = Infinity, maxVel = -Infinity;
+    for (const p of smoothPoints) {
+        const v = p.velocity !== undefined ? p.velocity : 0;
+        if (v < minVel) minVel = v;
+        if (v > maxVel) maxVel = v;
+    }
+    // If no velocity data, fall back to uniform width
+    if (minVel === Infinity) {
+        ctx.lineWidth = baseSize;
+        ctx.beginPath();
+        ctx.moveTo(smoothPoints[0].x, smoothPoints[0].y);
+        for (let i = 1; i < smoothPoints.length; i++) {
+            ctx.lineTo(smoothPoints[i].x, smoothPoints[i].y);
+        }
+        ctx.stroke();
+        return;
+    }
+
+    // Precompute widths for every segment
+    const widths = [];
+    for (let i = 0; i < smoothPoints.length - 1; i++) {
+        const p1 = smoothPoints[i];
+        const p2 = smoothPoints[i + 1];
+        const avgVel = ((p1.velocity !== undefined ? p1.velocity : 0) +
+            (p2.velocity !== undefined ? p2.velocity : 0)) / 2;
+        widths.push(velocityWidthMultiplier(avgVel, minVel, maxVel, baseSize));
+    }
+
+    // Walk the segments, grouping consecutive segments whose widths are within tolerance.
+    // Each group becomes one `beginPath()` / `stroke()` call to avoid overlapping round caps.
+    let i = 0;
+    while (i < smoothPoints.length - 1) {
+        let j = i + 1;
+        // Extend the group while the width changes less than the tolerance
+        while (j < smoothPoints.length - 1 && Math.abs(widths[j] - widths[j - 1]) <= WIDTH_TOLERANCE) {
+            j++;
+        }
+        // Use the average width of the group
+        let sum = 0;
+        for (let k = i; k < j; k++) sum += widths[k];
+        ctx.lineWidth = sum / (j - i);
+
+        ctx.beginPath();
+        ctx.moveTo(smoothPoints[i].x, smoothPoints[i].y);
+        for (let k = i + 1; k <= j; k++) {
+            ctx.lineTo(smoothPoints[k].x, smoothPoints[k].y);
+        }
+        ctx.stroke();
+
+        i = j; // move to next group
+    }
+}
+
+// Render Catmull-Rom splines through a list of points.
+// Each adjacent pair of stored points becomes a cubic curve segment
+// that smoothly blends into the next with shared tangents.
 function drawCurvePath(ctx, points) {
-    if (points.length === 0) return;
+    if (points.length < 2) return;
+    if (points.length === 2) {
+        ctx.beginPath();
+        ctx.moveTo(points[0].x, points[0].y);
+        ctx.lineTo(points[1].x, points[1].y);
+        ctx.stroke();
+        return;
+    }
+
     ctx.beginPath();
     ctx.moveTo(points[0].x, points[0].y);
+
     for (let i = 0; i < points.length - 1; i++) {
-        const midX = (points[i].x + points[i + 1].x) / 2;
-        const midY = (points[i].y + points[i + 1].y) / 2;
-        ctx.quadraticCurveTo(points[i].x, points[i].y, midX, midY);
+        const { p0, p1, p2, p3 } = getSplineControls(points, i);
+
+        for (let step = 1; step <= SMOOTHING_STEPS; step++) {
+            const t = step / SMOOTHING_STEPS;
+            const pt = catmullRomPoint(p0, p1, p2, p3, t, TENSION);
+            ctx.lineTo(pt.x, pt.y);
+        }
     }
-    ctx.lineTo(points[points.length - 1].x, points[points.length - 1].y);
+
     ctx.stroke();
 }
 
@@ -79,7 +237,10 @@ class Whiteboard {
         this.mouseBtn = document.getElementById('mouse');
         this.penBtn = document.getElementById('pen');
         this.eraserBtn = document.getElementById('eraser');
-        this.colorPicker = document.getElementById('colorPicker');
+        this.colorPickerWrap = document.querySelector('.color-picker-wrap');
+        this.colorBtn = document.querySelector('.color-btn');
+        this.colorDropdown = document.querySelector('.color-picker-dropdown');
+        this.colorSwatches = document.querySelectorAll('.color-swatch');
         this.sizePicker = document.getElementById('sizePicker');
         this.sizeValue = document.getElementById('sizeValue');
         this.toolbarToggle = document.querySelector('.toolbar-toggle');
@@ -424,12 +585,17 @@ class Whiteboard {
         if (stroke.points.length === 0) return;
 
         ctx.strokeStyle = stroke.color;
-        ctx.lineWidth = stroke.size;
         ctx.lineCap = 'round';
         ctx.lineJoin = 'round';
         ctx.globalCompositeOperation = 'source-over';
 
-        drawCurvePath(ctx, stroke.points);
+        // Use variable-width rendering for pen strokes that have velocity data
+        if (stroke.tool === TOOLS.PEN && stroke.points[0].velocity !== undefined) {
+            drawVariableWidthPath(ctx, stroke.points, stroke.size);
+        } else {
+            ctx.lineWidth = stroke.size;
+            drawCurvePath(ctx, stroke.points);
+        }
     }
 
     // Copy the visible portion of the offscreen canvas to the viewport
@@ -508,16 +674,27 @@ class Whiteboard {
 
     drawPenStroke(fromX, fromY, toX, toY) {
         const ctx = this.offscreenCtx;
+
+        // Compute velocity (distance) for this segment
+        const distance = Math.sqrt((toX - fromX) ** 2 + (toY - fromY) ** 2);
+
+        // Live drawing: show velocity-based width immediately
+        // Reference speed centers the effect; slow = thicker, fast = thinner
+        const velFactor = clamp(1 - distance / REF_SPEED, 0, 1);
+        const liveWidth = this.currentSize * (1 + VELOCITY_IMPACT * velFactor);
+
         ctx.strokeStyle = this.currentColor;
-        ctx.lineWidth = this.currentSize;
+        ctx.lineWidth = liveWidth;
         ctx.lineCap = 'round';
         ctx.lineJoin = 'round';
         ctx.globalCompositeOperation = 'source-over';
+        ctx.beginPath();
+        ctx.moveTo(fromX, fromY);
+        ctx.lineTo(toX, toY);
+        ctx.stroke();
 
-        const interpPoints = interpolatePoints(fromX, fromY, toX, toY, 2);
-
-        drawCurvePath(ctx, interpPoints);
-
+        // Store interpolated points with velocity data for later bezier rendering
+        const interpPoints = interpolatePoints(fromX, fromY, toX, toY, INTERP_STEP, distance);
         for (const p of interpPoints) {
             this.currentStroke.points.push(p);
         }
@@ -542,7 +719,7 @@ class Whiteboard {
                 tool: this.currentTool,
                 color: this.currentColor,
                 size: this.currentSize,
-                points: [{ x: virtualPos.x, y: virtualPos.y }],
+                points: [{ x: virtualPos.x, y: virtualPos.y, velocity: 0 }],
             };
         }
     }
@@ -612,6 +789,10 @@ class Whiteboard {
                     // If the oldest stroke was captured, remove it from questions too
                     this.removeStrokeFromQuestions(oldest);
                 }
+
+                // Replace the temporary live line-segment preview with the final
+                // spline-rendered stroke so jagged segments do not remain on the board.
+                this.renderAllStrokes();
             }
             this.currentStroke = null;
         }
@@ -689,8 +870,21 @@ class Whiteboard {
         this.canvas.addEventListener('touchcancel', (e) => this.onTouchEnd(e));
 
         // Controls
-        this.colorPicker.addEventListener('change', (e) => this.setColor(e.target.value));
+        this.colorBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            this.colorDropdown.classList.toggle('open');
+        });
+        this.colorSwatches.forEach(swatch => {
+            swatch.addEventListener('click', () => this.selectColor(swatch));
+        });
         this.sizePicker.addEventListener('input', (e) => this.setSize(e.target.value));
+
+        // Close color dropdown when clicking outside
+        document.addEventListener('click', (e) => {
+            if (!this.colorPickerWrap.contains(e.target)) {
+                this.colorDropdown.classList.remove('open');
+            }
+        });
 
         // Keyboard shortcuts
         const KEY_ACTIONS = {
@@ -743,6 +937,15 @@ class Whiteboard {
 
         // Update cursor
         this.canvas.classList.toggle('mouse-mode', tool === TOOLS.MOUSE);
+    }
+
+    selectColor(swatch) {
+        const color = swatch.dataset.color;
+        this.currentColor = color;
+        this.colorSwatches.forEach(s => s.classList.remove('active'));
+        swatch.classList.add('active');
+        this.colorBtn.style.background = color;
+        this.colorDropdown.classList.remove('open');
     }
 
     setColor(color) {

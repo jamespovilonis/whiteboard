@@ -17,8 +17,24 @@
                 <button id="pen" class="tool-btn active" title="Pen (P)" aria-label="Pen tool"><img src="icons/pencil.png" alt="Pen tool" class="tool-icon"></button>
                 <button id="eraser" class="tool-btn" title="Eraser (E)" aria-label="Eraser tool"><img src="icons/eraser.png" alt="Eraser tool" class="tool-icon"></button>
                 <div class="toolbar-divider" role="separator"></div>
-                <input type="color" id="colorPicker" value="#000000" title="Color" aria-label="Stroke color">
-                <input type="range" id="sizePicker" min="1" max="50" value="5" title="Brush size" aria-label="Brush size">
+                <div class="color-picker-wrap" title="Color" aria-label="Stroke color">
+                    <button class="color-btn" style="background:#000000" aria-label="Change color"></button>
+                    <div class="color-picker-dropdown">
+                        <div class="color-swatch swatch-black active" data-color="#000000" style="background:#000000"></div>
+                        <div class="color-swatch swatch-dark" data-color="#333333" style="background:#333333"></div>
+                        <div class="color-swatch swatch-gray" data-color="#888888" style="background:#888888"></div>
+                        <div class="color-swatch swatch-white" data-color="#ffffff" style="background:#ffffff"></div>
+                        <div class="color-swatch swatch-red" data-color="#e53935" style="background:#e53935"></div>
+                        <div class="color-swatch swatch-orange" data-color="#fb8c00" style="background:#fb8c00"></div>
+                        <div class="color-swatch swatch-yellow" data-color="#fdd835" style="background:#fdd835"></div>
+                        <div class="color-swatch swatch-green" data-color="#43a047" style="background:#43a047"></div>
+                        <div class="color-swatch swatch-cyan" data-color="#00acc1" style="background:#00acc1"></div>
+                        <div class="color-swatch swatch-blue" data-color="#1e88e5" style="background:#1e88e5"></div>
+                        <div class="color-swatch swatch-purple" data-color="#8e24aa" style="background:#8e24aa"></div>
+                        <div class="color-swatch swatch-pink" data-color="#d81b60" style="background:#d81b60"></div>
+                    </div>
+                </div>
+                <input type="range" id="sizePicker" min="1" max="10" value="4" title="Brush size" aria-label="Brush size">
                 <span id="sizeValue" aria-live="polite">5</span>
             </div>
         </div>
