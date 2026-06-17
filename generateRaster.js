@@ -2,26 +2,37 @@
 // Press 'r' to trigger.
 // The image is always saved as "raster.png", so successive calls overwrite the same file.
 
-// Rasterize the active question and return a Blob (for API consumption).
-// Returns null if no active question or no bbox.
-function rasterizeToBlob(wb) {
-    const targetQ = findActiveQuestion(wb.answerCapture.questions);
-    if (!targetQ || !targetQ.bbox) return null;
+// Rasterize a single line's bbox to a Blob (for API consumption).
+// Returns null if no bbox.
+function rasterizeLineToBlob(wb, line) {
+    if (!line || !line.bbox) return null;
 
-    const canvas = rasterizeToCanvas(wb, targetQ);
+    const canvas = rasterizeBboxToCanvas(wb, line.bbox);
     if (!canvas) return null;
 
-    // Convert canvas to Blob
     return new Promise(resolve => {
         canvas.toBlob(blob => resolve(blob), 'image/png');
     });
 }
 
-// Rasterize a specific question's bbox region to a canvas.
-function rasterizeToCanvas(wb, targetQ) {
+// Rasterize the active question's full bbox and return a Blob (for API consumption).
+// Returns null if no active question or no bbox.
+function rasterizeToBlob(wb) {
+    const targetQ = findActiveQuestion(wb.answerCapture.questions);
     if (!targetQ || !targetQ.bbox) return null;
 
-    const bbox = targetQ.bbox;
+    const canvas = rasterizeBboxToCanvas(wb, targetQ.bbox);
+    if (!canvas) return null;
+
+    return new Promise(resolve => {
+        canvas.toBlob(blob => resolve(blob), 'image/png');
+    });
+}
+
+// Rasterize a specific bbox region to a canvas.
+function rasterizeBboxToCanvas(wb, bbox) {
+    if (!bbox) return null;
+
     const x1 = Math.floor(bbox.x1);
     const y1 = Math.floor(bbox.y1);
     const x2 = Math.ceil(bbox.x2);
@@ -55,20 +66,31 @@ function findActiveQuestion(questions) {
     return null;
 }
 
-// Original generateRaster — downloads the raster as a PNG file.
+// Original generateRaster — detects lines and downloads each line as a separate PNG.
 function generateRaster(wb) {
     const targetQ = findActiveQuestion(wb.answerCapture.questions);
-    const canvas = rasterizeToCanvas(wb, targetQ);
-    if (!canvas) return;
+    if (!targetQ || !targetQ.bbox) return null;
 
-    const dataUrl = canvas.toDataURL('image/png');
-    const link = document.createElement('a');
-    link.download = 'raster.png';
-    link.href = dataUrl;
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
+    // Detect lines so we raster per-line
+    wb.answerCapture.detectLines(targetQ);
+    const lines = targetQ.lines || [];
+    if (lines.length === 0) return;
 
-    const bbox = targetQ.bbox;
-    console.log(`Rasterized question "${targetQ.id}" bbox [${Math.floor(bbox.x1)}, ${Math.floor(bbox.y1)}, ${Math.ceil(bbox.x2)}, ${Math.ceil(bbox.y2)}] → raster.png`);
+    for (const line of lines) {
+        if (!line.bbox) continue;
+
+        const canvas = rasterizeBboxToCanvas(wb, line.bbox);
+        if (!canvas) continue;
+
+        const dataUrl = canvas.toDataURL('image/png');
+        const link = document.createElement('a');
+        link.download = `${line.id}.png`;
+        link.href = dataUrl;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+
+        const bbox = line.bbox;
+        console.log(`Rasterized "${line.id}" bbox [${Math.floor(bbox.x1)}, ${Math.floor(bbox.y1)}, ${Math.ceil(bbox.x2)}, ${Math.ceil(bbox.y2)}] → ${line.id}.png`);
+    }
 }

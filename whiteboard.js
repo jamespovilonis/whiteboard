@@ -95,9 +95,6 @@ class Whiteboard {
         // Answer capture system (questions, zones, stroke capture)
         this.answerCapture = new AnswerCapture(this);
 
-        // Character capture system (groups strokes into individual characters)
-        this.characterCapture = new CharacterCapture(this);
-
         // Center the viewport on the board
         this.centerViewport();
 
@@ -181,9 +178,6 @@ class Whiteboard {
         // Draw answer capture elements (equations, zone overlays)
         this.answerCapture.render(ctx);
 
-        // Draw character capture overlays (character bounding boxes)
-        this.characterCapture.render(ctx);
-
         // Replay all strokes
         for (const stroke of this.strokes) {
             this.renderStroke(ctx, stroke);
@@ -196,14 +190,14 @@ class Whiteboard {
         this.updateLatexOverlays();
     }
 
-    // Update HTML overlays that show typeset LaTeX candidates.
-    // Renders a single fixed panel in the top-right corner with all candidates.
+    // Update HTML overlays that show typeset LaTeX candidates and unified layout.
+    // Renders per-line candidate panel (top-right) + unified LaTeX panel (below it).
     updateLatexOverlays() {
         const container = this.canvas.parentElement;
         if (!container) return;
 
         // Remove stale overlays
-        const existing = container.querySelectorAll('.latex-overlay');
+        const existing = container.querySelectorAll('.latex-overlay, .unified-latex-overlay');
         for (const el of existing) {
             el.remove();
         }
@@ -211,74 +205,114 @@ class Whiteboard {
         // Find the active question (the one most recently recognized)
         let activeQ = null;
         for (const q of this.answerCapture.questions) {
-            if (q.candidates && q.candidates.length > 0) {
+            if (q.lines && q.lines.length > 0 && q.lines.some(l => l.candidates && l.candidates.length > 0)) {
                 activeQ = q;
             }
         }
-        if (!activeQ) return;
+        if (!activeQ || !activeQ.lines) return;
 
-        const candidates = activeQ.candidates;
-
+        // ── Per-line candidate panel (top-right) ──
         const panel = document.createElement('div');
         panel.className = 'latex-overlay';
         container.appendChild(panel);
 
-        // Render top-1 candidate with confidence score
-        const topRow = document.createElement('div');
-        topRow.className = 'latex-overlay-top';
-        topRow.style.cssText = 'display:flex;align-items:baseline;gap:8px;margin-bottom:4px;';
-        panel.appendChild(topRow);
+        for (const line of activeQ.lines) {
+            if (!line.candidates || line.candidates.length === 0) continue;
 
-        const topLatex = document.createElement('span');
-        topLatex.className = 'latex-overlay-latex';
-        topRow.appendChild(topLatex);
-        if (typeof renderLatex === 'function') {
-            renderLatex(topLatex, candidates[0].latex);
-        } else if (typeof katex !== 'undefined') {
-            try {
-                katex.render(candidates[0].latex, topLatex, { throwOnError: false, displayMode: false });
-            } catch (err) {
+            // Line header
+            const lineHeader = document.createElement('div');
+            lineHeader.className = 'latex-overlay-line-header';
+            lineHeader.style.cssText = 'font-weight:bold;font-size:12px;color:#1a73e8;margin-top:8px;margin-bottom:2px;';
+            lineHeader.textContent = line.id;
+            panel.appendChild(lineHeader);
+
+            const candidates = line.candidates;
+
+            // Render top-1 candidate with confidence score
+            const topRow = document.createElement('div');
+            topRow.className = 'latex-overlay-top';
+            topRow.style.cssText = 'display:flex;align-items:baseline;gap:8px;margin-bottom:4px;';
+            panel.appendChild(topRow);
+
+            const topLatex = document.createElement('span');
+            topLatex.className = 'latex-overlay-latex';
+            topRow.appendChild(topLatex);
+            if (typeof renderLatex === 'function') {
+                renderLatex(topLatex, candidates[0].latex);
+            } else if (typeof katex !== 'undefined') {
+                try {
+                    katex.render(candidates[0].latex, topLatex, { throwOnError: false, displayMode: false });
+                } catch (err) {
+                    topLatex.textContent = candidates[0].latex;
+                }
+            } else {
                 topLatex.textContent = candidates[0].latex;
             }
-        } else {
-            topLatex.textContent = candidates[0].latex;
-        }
 
-        const scoreSpan = document.createElement('span');
-        scoreSpan.className = 'latex-overlay-score';
-        scoreSpan.textContent = `(${candidates[0].score.toFixed(3)})`;
-        topRow.appendChild(scoreSpan);
+            const scoreSpan = document.createElement('span');
+            scoreSpan.className = 'latex-overlay-score';
+            scoreSpan.textContent = `(${candidates[0].score.toFixed(3)})`;
+            topRow.appendChild(scoreSpan);
 
-        // Render alternates (2nd through 10th) below the top choice
-        if (candidates.length > 1) {
-            for (let i = 1; i < candidates.length; i++) {
-                const cand = candidates[i];
-                if (!cand.latex) continue;
+            // Render alternates (2nd through 10th) below the top choice
+            if (candidates.length > 1) {
+                for (let i = 1; i < candidates.length; i++) {
+                    const cand = candidates[i];
+                    if (!cand.latex) continue;
 
-                const altRow = document.createElement('div');
-                altRow.className = 'latex-overlay-alt';
+                    const altRow = document.createElement('div');
+                    altRow.className = 'latex-overlay-alt';
 
-                const altLatex = document.createElement('span');
-                altRow.appendChild(altLatex);
-                if (typeof renderLatex === 'function') {
-                    renderLatex(altLatex, cand.latex);
-                } else if (typeof katex !== 'undefined') {
-                    try {
-                        katex.render(cand.latex, altLatex, { throwOnError: false, displayMode: false });
-                    } catch (err) {
+                    const altLatex = document.createElement('span');
+                    altRow.appendChild(altLatex);
+                    if (typeof renderLatex === 'function') {
+                        renderLatex(altLatex, cand.latex);
+                    } else if (typeof katex !== 'undefined') {
+                        try {
+                            katex.render(cand.latex, altLatex, { throwOnError: false, displayMode: false });
+                        } catch (err) {
+                            altLatex.textContent = cand.latex;
+                        }
+                    } else {
                         altLatex.textContent = cand.latex;
                     }
-                } else {
-                    altLatex.textContent = cand.latex;
+
+                    const altScore = document.createElement('span');
+                    altScore.className = 'latex-overlay-score-alt';
+                    altScore.textContent = `(${cand.score.toFixed(3)})`;
+                    altRow.appendChild(altScore);
+
+                    panel.appendChild(altRow);
                 }
-
-                const altScore = document.createElement('span');
-                altScore.className = 'latex-overlay-score-alt';
-                altScore.textContent = `(${cand.score.toFixed(3)})`;
-                altRow.appendChild(altScore);
-
-                panel.appendChild(altRow);
             }
+        }
+
+        // ── Unified LaTeX panel (below the candidate panel) ──
+        if (!activeQ.unifiedLatex) return;
+
+        const unifiedPanel = document.createElement('div');
+        unifiedPanel.className = 'unified-latex-overlay';
+        container.appendChild(unifiedPanel);
+
+        const unifiedHeader = document.createElement('div');
+        unifiedHeader.className = 'unified-latex-header';
+        unifiedHeader.textContent = '📐 Unified Layout';
+        unifiedPanel.appendChild(unifiedHeader);
+
+        const unifiedContent = document.createElement('div');
+        unifiedContent.className = 'unified-latex-content';
+        unifiedPanel.appendChild(unifiedContent);
+
+        if (typeof renderLatex === 'function') {
+            renderLatex(unifiedContent, activeQ.unifiedLatex);
+        } else if (typeof katex !== 'undefined') {
+            try {
+                katex.render(activeQ.unifiedLatex, unifiedContent, { throwOnError: false, displayMode: false });
+            } catch (err) {
+                unifiedContent.textContent = activeQ.unifiedLatex;
+            }
+        } else {
+            unifiedContent.textContent = activeQ.unifiedLatex;
         }
     }
 
@@ -448,8 +482,6 @@ class Whiteboard {
                     const removed = this.strokes[idx];
                     // Clean up question associations
                     this.answerCapture.removeStrokeFromQuestions(removed);
-                    // Clean up character group associations
-                    this.characterCapture.removeStrokeFromCharacters(removed);
                     this.strokes.splice(idx, 1);
                 }
                 this.currentEraserHits.clear();
@@ -472,14 +504,11 @@ class Whiteboard {
                 this.strokes.push(this.currentStroke);
                 // Capture this stroke into any question it belongs to
                 this.answerCapture.captureStroke(this.currentStroke);
-                // Capture this stroke into any character group it belongs to
-                this.characterCapture.captureStroke(this.currentStroke);
                 // Enforce stroke limit — drop oldest strokes
                 while (this.strokes.length > MAX_STROKES) {
                     const oldest = this.strokes.shift();
-                    // If the oldest stroke was captured, remove it from questions and characters too
+                    // If the oldest stroke was captured, remove it from questions
                     this.answerCapture.removeStrokeFromQuestions(oldest);
-                    this.characterCapture.removeStrokeFromCharacters(oldest);
                 }
 
                 // Replace the temporary live line-segment preview with the final
@@ -585,7 +614,6 @@ class Whiteboard {
             e: () => this.selectTool(TOOLS.ERASER),
             v: () => {
                 this.answerCapture.toggleCaptureBoxes();
-                this.characterCapture.toggleCaptureBoxes();
             },
             d: () => this.answerCapture.dumpCaptureData(),
             b: () => this.answerCapture.addNextQuestion(),

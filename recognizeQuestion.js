@@ -87,7 +87,8 @@ async function recognizeImage(imageBlob) {
     return data;
 }
 
-// Main entry: find the active question, rasterize it, send to API, store result.
+// Main entry: find the active question, detect lines, rasterize each line,
+// send to API individually, store per-line results.
 async function recognizeActiveQuestion(wb) {
     if (isRecognizing) return;
 
@@ -108,42 +109,60 @@ async function recognizeActiveQuestion(wb) {
         return;
     }
 
-    setRecognizing(true);
-    showToast(`Recognizing question "${targetQ.id}" ...`, 'info', 2000);
+    // Detect distinct lines of writing within this question
+    wb.answerCapture.detectLines(targetQ);
+    const lines = targetQ.lines || [];
 
-    // Rasterize the question's bbox region to a Blob
-    const blob = await rasterizeToBlob(wb);
-    if (!blob) {
-        setRecognizing(false);
-        showToast('Failed to rasterize question region.', 'error');
+    if (lines.length === 0) {
+        showToast(`No lines detected in question "${targetQ.id}".`, 'error');
         return;
     }
 
-    try {
-        // Send to CoMER API — now returns { candidates: [...], top: {...} }
-        const data = await recognizeImage(blob);
-        const candidates = data.candidates || [];
-        const topLatex = data.top ? data.top.latex : '';
-
-        console.log(`Recognition result for "${targetQ.id}":`, candidates);
-
-        // Store results on the question object
-        targetQ.recognizedLatex = topLatex;
-        targetQ.candidates = candidates;
-
-        // Re-render the board to show the LaTeX results
+    // Auto-show the line boxes so the user can see the 1.5× threshold result
+    if (!wb.answerCapture.showCaptureBoxes) {
+        wb.answerCapture.toggleCaptureBoxes();
+    } else {
         wb.renderAllStrokes();
+    }
 
-        if (topLatex) {
-            showToast(`Recognized: ${topLatex}`, 'success', 4000);
-        } else {
-            showToast('Recognition returned empty result.', 'error');
+    setRecognizing(true);
+    showToast(`Recognizing ${lines.length} line(s) in "${targetQ.id}" ...`, 'info', 2000);
+
+    let successCount = 0;
+    for (const line of lines) {
+        if (!line.bbox) continue;
+
+        const blob = await rasterizeLineToBlob(wb, line);
+        if (!blob) continue;
+
+        try {
+            const data = await recognizeImage(blob);
+            const candidates = data.candidates || [];
+            const topLatex = data.top ? data.top.latex : '';
+
+            console.log(`Recognition result for "${line.id}":`, candidates);
+
+            line.recognizedLatex = topLatex;
+            line.candidates = candidates;
+            successCount++;
+        } catch (err) {
+            console.error(`Recognition failed for "${line.id}":`, err);
         }
-    } catch (err) {
-        console.error('Recognition failed:', err);
-        showToast(`Recognition failed.\n\n${err.message}`, 'error', 6000);
-    } finally {
-        setRecognizing(false);
+    }
+
+    setRecognizing(false);
+
+    // Synthesize per-line results into a unified LaTeX string
+    targetQ.unifiedLatex = synthesizeUnifiedLatex(targetQ);
+
+    // Re-render to show results
+    wb.renderAllStrokes();
+
+    if (successCount > 0) {
+        const hasUnified = targetQ.unifiedLatex ? ' (unified)' : '';
+        showToast(`Recognized ${successCount}/${lines.length} line(s)${hasUnified}.`, 'success', 4000);
+    } else {
+        showToast('Recognition returned no results.', 'error');
     }
 }
 
@@ -178,4 +197,65 @@ function renderLatex(element, latex) {
         }
     }
     element.textContent = latex;
+}
+
+// Synthesize per-line recognized LaTeX strings into a single unified LaTeX
+// string that preserves spatial layout (horizontal indentation, vertical gaps)
+// using an `array` environment with \hspace* and \\[Xem] spacing.
+// The em scale is based on the median line height so spacing is proportional.
+function synthesizeUnifiedLatex(question) {
+    if (!question.lines || question.lines.length === 0) return '';
+
+    // Filter to lines that have both a bbox and recognized latex
+    const validLines = question.lines.filter(l => l.bbox && l.recognizedLatex);
+    if (validLines.length === 0) return '';
+
+    // Find the leftmost line (reference for horizontal offsets)
+    let leftmostX = Infinity;
+    const lineHeights = [];
+    for (const line of validLines) {
+        if (line.bbox.x1 < leftmostX) leftmostX = line.bbox.x1;
+        lineHeights.push(line.bbox.y2 - line.bbox.y1);
+    }
+
+    // Median line height as the em scale factor
+    const sortedHeights = [...lineHeights].sort((a, b) => a - b);
+    const emScale = sortedHeights[Math.floor(sortedHeights.length / 2)] || 40;
+
+    // Sort lines top-to-bottom
+    validLines.sort((a, b) => a.bbox.y1 - b.bbox.y1);
+
+    // Build the LaTeX array
+    const rows = [];
+    for (let i = 0; i < validLines.length; i++) {
+        const line = validLines[i];
+
+        // Horizontal offset from leftmost line, in em units
+        const hOffset = (line.bbox.x1 - leftmostX) / emScale;
+        const hSpace = hOffset > 0.001 ? `\\hspace*{${hOffset.toFixed(2)}em}` : '';
+
+        // Vertical gap from the previous line's bottom to this line's top
+        let vGapStr = '';
+        if (i > 0) {
+            const prev = validLines[i - 1];
+            const vGap = (line.bbox.y1 - prev.bbox.y2) / emScale;
+            if (vGap > 0.01) {
+                vGapStr = `\\\\[${vGap.toFixed(2)}em]`;
+            } else {
+                vGapStr = '\\\\';
+            }
+        }
+
+        const lineLatex = line.recognizedLatex.replace(/\\\\/g, ''); // strip trailing \\ from model output
+        if (i === 0) {
+            rows.push(`${hSpace}${lineLatex}`);
+        } else {
+            rows.push(`${vGapStr}\n${hSpace}${lineLatex}`);
+        }
+    }
+
+    const unifiedLatex = `\\begin{array}{l}\n${rows.join(' ')}\n\\end{array}`;
+
+    console.log(`[synthesizeUnifiedLatex] emScale=${emScale.toFixed(1)}, lines=${validLines.length}, latex:`, unifiedLatex);
+    return unifiedLatex;
 }

@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Unified LaTeX Synthesis Tests</title>
+    <script src="answerCapture.js" defer></script>
+    <script src="recognizeQuestion.js" defer></script>
+    <script>
+        // ====================================================================
+        // Test Harness
+        // ====================================================================
+        document.addEventListener('DOMContentLoaded', () => {
+            const resultsEl = document.getElementById('results');
+            let passCount = 0, failCount = 0;
+            const log = (msg, cls = '') => {
+                const div = document.createElement('div');
+                div.className = cls;
+                div.textContent = msg;
+                resultsEl.appendChild(div);
+            };
+            const pass = (msg) => { log('✅ ' + msg, 'pass'); passCount++; };
+            const fail = (msg) => { log('❌ ' + msg, 'fail'); failCount++; };
+            const info = (msg) => { log('  ' + msg, 'info'); };
+
+            function assert(condition, msg) {
+                if (condition) pass(msg); else fail(msg);
+            }
+
+            function assertClose(actual, expected, tolerance, msg) {
+                const ok = Math.abs(actual - expected) <= tolerance;
+                if (ok) pass(`${msg} (${actual.toFixed(2)} ≈ ${expected.toFixed(2)})`);
+                else fail(`${msg}: got ${actual.toFixed(2)}, expected ${expected.toFixed(2)}`);
+            }
+
+            // ---- Helpers to create synthetic strokes ----
+            function makeStroke(x1, y1, x2, y2) {
+                const points = [];
+                const steps = 20;
+                for (let i = 0; i <= steps; i++) {
+                    const t = i / steps;
+                    points.push({ x: x1 + (x2 - x1) * t, y: y1 + (y2 - y1) * t });
+                }
+                return { points, color: '#000', size: 4, tool: 'pen' };
+            }
+
+            function makeQuestion(wb, id, eq, textX, textY) {
+                return {
+                    id, equation: eq, textX, textY,
+                    zone: { x: textX - 250, y: textY + 30, w: 800, h: 600 },
+                    bbox: null, strokes: [], frozen: false,
+                    recognizedLatex: null, lines: null, unifiedLatex: null,
+                };
+            }
+
+            // Mock whiteboard — minimal subset
+            const BOARD_WIDTH = 5000, BOARD_HEIGHT = 5000;
+            const mockWb = {
+                BOARD_WIDTH, BOARD_HEIGHT,
+                strokes: [],
+                answerCapture: null,
+                renderAllStrokes() {},  // no-op for testing
+            };
+
+            const ac = new AnswerCapture(mockWb);
+            mockWb.answerCapture = ac;
+            ac.questions = [];
+            ac.nextQuestionId = 2;
+
+            // ====================================================================
+            // TEST 1: Single line (degenerate)
+            // ====================================================================
+            log('── Test 1: Single line ──', 'header');
+            const q1 = makeQuestion(mockWb, 'q1', '2x – 5 = 11', 2000, 2000);
+            q1.strokes = [
+                makeStroke(2000, 2500, 2250, 2500),  // "2x"
+                makeStroke(2300, 2500, 2500, 2500),  // "-5"
+                makeStroke(2550, 2500, 2750, 2500),  // "="
+            ];
+            ac.questions = [q1];
+            ac.detectLines(q1);
+            assert(q1.lines.length === 1, '1 line detected');
+            if (q1.lines.length === 1) {
+                const l = q1.lines[0];
+                assert(l.bbox !== null, 'Line has bbox');
+                info(`  bbox: [${l.bbox.x1.toFixed(0)}, ${l.bbox.y1.toFixed(0)}, ${l.bbox.x2.toFixed(0)}, ${l.bbox.y2.toFixed(0)}]`);
+            }
+            // Simulate recognition
+            q1.lines[0].recognizedLatex = '2x-5';
+            const u1 = synthesizeUnifiedLatex(q1);
+            info(`  unified: ${u1}`);
+            assert(u1.includes('\\begin{array}{l}'), 'Contains array env');
+            assert(!u1.includes('\\\\'), 'No \\\\ (single line)');
+            assert(u1.includes('2x-5'), 'Contains recognized latex');
+
+            // ====================================================================
+            // TEST 2: Two lines, second indented
+            // ====================================================================
+            log('── Test 2: Two lines, second indented ──', 'header');
+            const q2 = makeQuestion(mockWb, 'q2', 'Test 2', 2000, 2000);
+            q2.strokes = [
+                // Line 1: "2x-5=11" at y≈2500, x=2000..2600
+                makeStroke(2000, 2500, 2300, 2510),
+                makeStroke(2350, 2490, 2600, 2505),
+                // Line 2: "x=8" at y≈2800, x=2200..2400 (indented 200px)
+                makeStroke(2200, 2800, 2250, 2810),
+                makeStroke(2300, 2790, 2400, 2805),
+            ];
+            ac.questions = [q2];
+            ac.detectLines(q2);
+            assert(q2.lines.length === 2, '2 lines detected');
+
+            if (q2.lines.length === 2) {
+                const l1 = q2.lines[0], l2 = q2.lines[1];
+                info(`  Line 1 bbox y: [${l1.bbox.y1.toFixed(0)}, ${l1.bbox.y2.toFixed(0)}]`);
+                info(`  Line 2 bbox y: [${l2.bbox.y1.toFixed(0)}, ${l2.bbox.y2.toFixed(0)}]`);
+                info(`  Line 2 x1: ${l2.bbox.x1.toFixed(0)}, Line 1 x1: ${l1.bbox.x1.toFixed(0)}`);
+
+                l1.recognizedLatex = '2x-5=11';
+                l2.recognizedLatex = 'x=8';
+                const u2 = synthesizeUnifiedLatex(q2);
+                info(`  unified: ${u2}`);
+                assert(u2.includes('\\hspace'), 'Contains hspace for indent');
+                assert(u2.includes('\\\\'), 'Contains line break between lines');
+                assert(u2.includes('2x-5=11'), 'Contains line 1 latex');
+                assert(u2.includes('x=8'), 'Contains line 2 latex');
+
+                // Verify em-scale math
+                const heights = [(l1.bbox.y2 - l1.bbox.y1), (l2.bbox.y2 - l2.bbox.y1)].sort((a,b)=>a-b);
+                const emScale = heights[Math.floor(heights.length/2)];
+                const expectedHOffset = (l2.bbox.x1 - l1.bbox.x1) / emScale;
+                const expectedVGap = (l2.bbox.y1 - l1.bbox.y2) / emScale;
+                info(`  emScale: ${emScale.toFixed(1)}, expected hOffset: ${expectedHOffset.toFixed(2)}em, vGap: ${expectedVGap.toFixed(2)}em`);
+            }
+
+            // ====================================================================
+            // TEST 3: Wide vertical gap
+            // ====================================================================
+            log('── Test 3: Wide vertical gap ──', 'header');
+            const q3 = makeQuestion(mockWb, 'q3', 'Test 3', 2000, 2000);
+            q3.strokes = [
+                makeStroke(2000, 2000, 2300, 2010),   // Line 1, y≈2000
+                makeStroke(2350, 1990, 2600, 2005),
+                makeStroke(2000, 3000, 2250, 3010),   // Line 2, y≈3000 (1000px gap)
+                makeStroke(2300, 2990, 2500, 3005),
+            ];
+            ac.questions = [q3];
+            ac.detectLines(q3);
+            assert(q3.lines.length === 2, '2 lines detected despite 1000px gap');
+
+            if (q3.lines.length === 2) {
+                const l1 = q3.lines[0], l2 = q3.lines[1];
+                l1.recognizedLatex = 'Step1';
+                l2.recognizedLatex = 'Step2';
+                const u3 = synthesizeUnifiedLatex(q3);
+                info(`  unified: ${u3}`);
+                // Should have a large \\[Xem] between them
+                const vGapMatch = u3.match(/\\\\\[(\d+\.\d+)em\]/);
+                assert(vGapMatch !== null, 'Contains \\\\[Xem] for vertical gap');
+                if (vGapMatch) {
+                    const vGapEm = parseFloat(vGapMatch[1]);
+                    assert(vGapEm > 1.0, `Vertical gap ${vGapEm.toFixed(2)}em > 1em (large gap)`);
+                }
+            }
+
+            // ====================================================================
+            // TEST 4: Three lines, cascading indent
+            // ====================================================================
+            log('── Test 4: Three lines, cascading indent ──', 'header');
+            const q4 = makeQuestion(mockWb, 'q4', 'Test 4', 2000, 2000);
+            q4.strokes = [
+                // Line 1: "2x-5=11"  at y=2500, x=2000..2500
+                makeStroke(2000, 2500, 2150, 2510),
+                makeStroke(2200, 2490, 2500, 2505),
+                // Line 2: "2x=16"     at y=2700, x=2100..2400 (indented 100px)
+                makeStroke(2100, 2700, 2250, 2710),
+                makeStroke(2280, 2690, 2400, 2705),
+                // Line 3: "x=8"       at y=2900, x=2200..2400 (indented 200px)
+                makeStroke(2200, 2900, 2250, 2910),
+                makeStroke(2300, 2890, 2400, 2905),
+            ];
+            ac.questions = [q4];
+            ac.detectLines(q4);
+            assert(q4.lines.length === 3, '3 lines detected');
+
+            if (q4.lines.length === 3) {
+                q4.lines[0].recognizedLatex = '2x-5=11';
+                q4.lines[1].recognizedLatex = '2x=16';
+                q4.lines[2].recognizedLatex = 'x=8';
+                const u4 = synthesizeUnifiedLatex(q4);
+                info(`  unified: ${u4}`);
+
+                // Count hspace occurrences
+                const hspaceCount = (u4.match(/\\hspace/g) || []).length;
+                info(`  hspace directives: ${hspaceCount}`);
+                assert(hspaceCount === 2, 'Two hspace directives (lines 2 and 3)');
+
+                // Count line breaks
+                const lineBreakCount = (u4.match(/\\\\/g) || []).length;
+                info(`  line breaks: ${lineBreakCount}`);
+                assert(lineBreakCount === 2, 'Two line breaks for 3 lines');
+
+                // All three equations present
+                assert(u4.includes('2x-5=11'), 'Line 1 present');
+                assert(u4.includes('2x=16'), 'Line 2 present');
+                assert(u4.includes('x=8'), 'Line 3 present');
+            }
+
+            // ====================================================================
+            // TEST 5: Trailing \\ stripping
+            // ====================================================================
+            log('── Test 5: Trailing \\\\ stripping ──', 'header');
+            const q5 = makeQuestion(mockWb, 'q5', 'Test 5', 2000, 2000);
+            q5.strokes = [
+                makeStroke(2000, 2500, 2300, 2510),
+            ];
+            ac.questions = [q5];
+            ac.detectLines(q5);
+            q5.lines[0].recognizedLatex = '2x-5\\\\';
+            const u5 = synthesizeUnifiedLatex(q5);
+            info(`  unified: ${u5}`);
+            assert(!u5.includes('\\\\\\\\'), 'Trailing \\\\ was stripped (no double backslash)');
+
+            // ====================================================================
+            // TEST 6: Empty lines (no recognizedLatex)
+            // ====================================================================
+            log('── Test 6: Partial recognition ──', 'header');
+            const q6 = makeQuestion(mockWb, 'q6', 'Test 6', 2000, 2000);
+            q6.strokes = [
+                makeStroke(2000, 2400, 2300, 2410),
+                makeStroke(2000, 2700, 2300, 2710),
+            ];
+            ac.questions = [q6];
+            ac.detectLines(q6);
+            q6.lines[0].recognizedLatex = 'line1';
+            q6.lines[1].recognizedLatex = '';  // empty — should be filtered out
+            const u6 = synthesizeUnifiedLatex(q6);
+            info(`  unified: ${u6}`);
+            assert(u6.includes('line1'), 'Recognized line included');
+            assert(!u6.includes('\\\\'), 'No line break (only 1 valid line)');
+
+            // ====================================================================
+            // Summary
+            // ====================================================================
+            log('────────────────────────', 'header');
+            log(`Results: ${passCount} passed, ${failCount} failed`, failCount > 0 ? 'fail' : 'pass');
+            if (failCount === 0) {
+                log('🎉 All tests passed!', 'pass');
+            }
+        });
+    </script>
+    <style>
+        body {
+            font-family: 'Segoe UI', system-ui, sans-serif;
+            background: #1a1a2e;
+            color: #e0e0e0;
+            margin: 0;
+            padding: 24px;
+            min-height: 100vh;
+        }
+        h1 {
+            color: #5e5ce6;
+            font-size: 24px;
+            margin-bottom: 16px;
+        }
+        #results {
+            background: #16213e;
+            border-radius: 12px;
+            padding: 20px;
+            max-width: 800px;
+            font-size: 14px;
+            line-height: 1.6;
+            font-family: 'SF Mono', 'Fira Code', monospace;
+        }
+        .header {
+            color: #5e5ce6;
+            font-weight: 700;
+            font-size: 15px;
+            margin-top: 12px;
+        }
+        .pass {
+            color: #4caf50;
+        }
+        .fail {
+            color: #f44336;
+        }
+        .info {
+            color: #90a4ae;
+            font-size: 13px;
+        }
+    </style>
+</head>
+<body>
+    <h1>🧪 Unified LaTeX Synthesis Tests</h1>
+    <div id="results"></div>
+</body>
+</html>

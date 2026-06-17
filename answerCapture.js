@@ -46,6 +46,106 @@ class AnswerCapture {
         ];
     }
 
+    // Compute the bounding box of a stroke from its points
+    _getStrokeBbox(stroke) {
+        if (stroke.points.length === 0) return null;
+        let x1 = stroke.points[0].x, y1 = stroke.points[0].y;
+        let x2 = x1, y2 = y1;
+        for (const p of stroke.points) {
+            if (p.x < x1) x1 = p.x;
+            if (p.y < y1) y1 = p.y;
+            if (p.x > x2) x2 = p.x;
+            if (p.y > y2) y2 = p.y;
+        }
+        return { x1, y1, x2, y2 };
+    }
+
+    // Detect distinct horizontal lines within a question's strokes.
+    // Groups strokes by Y-coordinate clustering, splitting when the
+    // Y-gap between consecutive strokes exceeds 1.5× median stroke height.
+    detectLines(question) {
+        const strokes = question.strokes;
+        if (strokes.length === 0) {
+            question.lines = [];
+            return;
+        }
+
+        // Compute Y-centre and height for each stroke
+        const strokeData = [];
+        for (const s of strokes) {
+            const bbox = this._getStrokeBbox(s);
+            if (!bbox) continue;
+            strokeData.push({
+                stroke: s,
+                yCenter: (bbox.y1 + bbox.y2) / 2,
+                height: bbox.y2 - bbox.y1,
+                bbox,
+            });
+        }
+        if (strokeData.length === 0) {
+            question.lines = [];
+            return;
+        }
+
+        // Sort by Y-centre top-to-bottom
+        strokeData.sort((a, b) => a.yCenter - b.yCenter);
+
+        // Compute median stroke height
+        const heights = strokeData.map(d => d.height).sort((a, b) => a - b);
+        const medianHeight = heights[Math.floor(heights.length / 2)];
+        const gapThreshold = medianHeight * 1.5;
+
+        // Debug: log line detection parameters
+        console.log(`[detectLines] Question: ${question.id}, strokes: ${strokeData.length}, medianHeight: ${medianHeight.toFixed(1)}, gapThreshold: ${gapThreshold.toFixed(1)}`);
+
+        // Cluster strokes into lines
+        const clusters = [];
+        let currentCluster = [strokeData[0]];
+
+        for (let i = 1; i < strokeData.length; i++) {
+            const prev = currentCluster[currentCluster.length - 1];
+            const curr = strokeData[i];
+            const yGap = curr.yCenter - prev.yCenter;
+
+            if (yGap > gapThreshold) {
+                // New line
+                clusters.push(currentCluster);
+                currentCluster = [curr];
+            } else {
+                currentCluster.push(curr);
+            }
+        }
+        clusters.push(currentCluster);
+
+                // Build line objects with bboxes
+        question.lines = clusters.map((cluster, idx) => {
+            let bbox = null;
+            const lineStrokes = [];
+            for (const sd of cluster) {
+                lineStrokes.push(sd.stroke);
+                if (bbox === null) {
+                    bbox = { ...sd.bbox };
+                } else {
+                    if (sd.bbox.x1 < bbox.x1) bbox.x1 = sd.bbox.x1;
+                    if (sd.bbox.y1 < bbox.y1) bbox.y1 = sd.bbox.y1;
+                    if (sd.bbox.x2 > bbox.x2) bbox.x2 = sd.bbox.x2;
+                    if (sd.bbox.y2 > bbox.y2) bbox.y2 = sd.bbox.y2;
+                }
+            }
+            // Debug: log each line's Y-range
+            if (bbox) {
+                console.log(`[detectLines]   Line ${idx + 1}: ${lineStrokes.length} strokes, Y-range [${bbox.y1.toFixed(1)}, ${bbox.y2.toFixed(1)}], height=${(bbox.y2 - bbox.y1).toFixed(1)}`);
+            }
+            return {
+                id: question.id + '_line' + (idx + 1),
+                bbox,
+                strokes: lineStrokes,
+                recognizedLatex: null,
+                candidates: [],
+            };
+        });
+    }
+
     // Check if a point falls within any question's capture zone OR within
     // any question's dynamic bbox (with padding for chain growth).
     // Returns the question object if found, or null.
@@ -104,6 +204,12 @@ class AnswerCapture {
         if (capturedBy.size > 0) {
             this.recheckUncapturedStrokes();
         }
+
+        // Re-detect lines for any question that captured this stroke
+        for (const qId of capturedBy) {
+            const q = this.questions.find(qq => qq.id === qId);
+            if (q) this.detectLines(q);
+        }
     }
 
     // Iteratively scan uncaptured strokes — any that newly intersect an expanded
@@ -141,6 +247,8 @@ class AnswerCapture {
             for (const s of q.strokes) {
                 this.expandBboxForStroke(q, s);
             }
+            // Re-detect lines after removal
+            this.detectLines(q);
         }
     }
 
@@ -276,6 +384,45 @@ class AnswerCapture {
                     ctx.textBaseline = 'bottom';
                     ctx.fillText(`[${q.id}] ${q.strokes.length} stroke(s)`, q.zone.x, q.zone.y - 5);
                 }
+
+                // Draw line-level catchment boxes (blue, with proportional padding)
+                if (q.lines && q.lines.length > 0) {
+                    for (const line of q.lines) {
+                        if (!line.bbox) continue;
+
+                        const lineW = line.bbox.x2 - line.bbox.x1;
+                        const lineH = line.bbox.y2 - line.bbox.y1;
+                        const vPad = lineH * 0.20;    // 20% vertical padding
+                        const hPad = lineW * 1.0;      // 100% horizontal padding
+                        const bx = line.bbox.x1 - hPad;
+                        const by = line.bbox.y1 - vPad;
+                        const bw = lineW + hPad * 2;
+                        const bh = lineH + vPad * 2;
+
+                        // Solid tight content bbox — exact region sent to the model
+                        ctx.save();
+                        ctx.strokeStyle = 'rgba(255, 87, 34, 0.7)';
+                        ctx.lineWidth = 2;
+                        ctx.strokeRect(line.bbox.x1, line.bbox.y1, lineW, lineH);
+
+                        // Dashed line style for catchment indication
+                        ctx.setLineDash([8, 6]);
+                        ctx.fillStyle = 'rgba(33, 150, 243, 0.06)';
+                        ctx.strokeStyle = 'rgba(33, 150, 243, 0.45)';
+                        ctx.lineWidth = 2;
+                        ctx.fillRect(bx, by, bw, bh);
+                        ctx.strokeRect(bx, by, bw, bh);
+                        ctx.setLineDash([]);
+
+                        // Line label
+                        ctx.fillStyle = 'rgba(33, 150, 243, 0.85)';
+                        ctx.font = 'bold 16px "Segoe UI", Arial, sans-serif';
+                        ctx.textAlign = 'left';
+                        ctx.textBaseline = 'bottom';
+                        ctx.fillText(`[${line.id}] ${line.strokes.length} stroke(s)`, bx, by - 4);
+                        ctx.restore();
+                    }
+                }
             }
         }
     }
@@ -296,12 +443,18 @@ class AnswerCapture {
             for (let i = 0; i < q.strokes.length; i++) {
                 const s = q.strokes[i];
                 console.log(`    Stroke ${i + 1}: ${s.points.length} points, color=${s.color}, size=${s.size}`);
-                // Log a few sample points to verify
                 if (s.points.length > 0) {
                     const first = s.points[0];
                     const last = s.points[s.points.length - 1];
                     console.log(`      First: ({ x: ${first.x.toFixed(1)}, y: ${first.y.toFixed(1)} })`);
                     console.log(`      Last:  ({ x: ${last.x.toFixed(1)}, y: ${last.y.toFixed(1)} })`);
+                }
+            }
+            // Line detection info
+            if (q.lines) {
+                console.log(`  Lines detected: ${q.lines.length}`);
+                for (const line of q.lines) {
+                    console.log(`    ${line.id}: bbox=${line.bbox ? JSON.stringify(line.bbox) : 'null'}, strokes=${line.strokes.length}, recognizedLatex=${line.recognizedLatex || 'null'}`);
                 }
             }
         }
