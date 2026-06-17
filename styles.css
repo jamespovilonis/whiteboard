@@ -385,18 +385,49 @@ button.tool-btn.recognize-btn.spinning .tool-icon {
     background: rgba(52, 199, 89, 0.92);
 }
 
-/* Typeset LaTeX result overlay */
+/* Typeset LaTeX candidate panel — fixed top-right corner */
 .latex-overlay {
-    position: absolute;
-    pointer-events: none;
-    z-index: 5;
-    padding: 6px 12px;
-    border-radius: 10px;
-    background: rgba(255, 255, 255, 0.92);
-    box-shadow: 0 2px 12px rgba(0, 0, 0, 0.12);
-    color: var(--latex-color);
+    position: fixed;
+    top: 16px;
+    right: 16px;
+    z-index: 50;
+    max-width: min(480px, calc(100vw - 32px));
+    max-height: calc(100vh - 100px);
+    overflow-y: auto;
+    padding: 14px 18px;
+    border-radius: 14px;
+    background: rgba(255, 255, 255, 0.96);
+    box-shadow: 0 4px 24px rgba(0, 0, 0, 0.15), 0 1px 4px rgba(0, 0, 0, 0.08);
+    border: 1px solid rgba(0, 0, 0, 0.06);
     font-size: 18px;
-    line-height: 1.3;
-    transform: translateY(-100%);
-    margin-top: -8px;
+    line-height: 1.5;
+}
+
+.latex-overlay .latex-overlay-top {
+    font-weight: 600;
+    color: #1a1a1a;
+}
+
+.latex-overlay .latex-overlay-score {
+    font-size: 13px;
+    color: #888;
+    font-family: monospace;
+    white-space: nowrap;
+}
+
+.latex-overlay .latex-overlay-alt {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    font-size: 14px;
+    color: #999;
+    margin-left: 12px;
+    margin-bottom: 2px;
+}
+
+.latex-overlay .latex-overlay-score-alt {
+    font-size: 11px;
+    font-family: monospace;
+    white-space: nowrap;
+    color: #bbb;
 }

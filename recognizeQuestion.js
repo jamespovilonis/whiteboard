@@ -84,7 +84,7 @@ async function recognizeImage(imageBlob) {
     }
 
     const data = await response.json();
-    return data.latex;
+    return data;
 }
 
 // Main entry: find the active question, rasterize it, send to API, store result.
@@ -120,18 +120,22 @@ async function recognizeActiveQuestion(wb) {
     }
 
     try {
-        // Send to CoMER API
-        const latex = await recognizeImage(blob);
-        console.log(`Recognition result for "${targetQ.id}": ${latex}`);
+        // Send to CoMER API — now returns { candidates: [...], top: {...} }
+        const data = await recognizeImage(blob);
+        const candidates = data.candidates || [];
+        const topLatex = data.top ? data.top.latex : '';
 
-        // Store result in the question object
-        targetQ.recognizedLatex = latex;
+        console.log(`Recognition result for "${targetQ.id}":`, candidates);
 
-        // Re-render the board to show the LaTeX result
+        // Store results on the question object
+        targetQ.recognizedLatex = topLatex;
+        targetQ.candidates = candidates;
+
+        // Re-render the board to show the LaTeX results
         wb.renderAllStrokes();
 
-        if (latex) {
-            showToast(`Recognized: ${latex}`, 'success', 4000);
+        if (topLatex) {
+            showToast(`Recognized: ${topLatex}`, 'success', 4000);
         } else {
             showToast('Recognition returned empty result.', 'error');
         }

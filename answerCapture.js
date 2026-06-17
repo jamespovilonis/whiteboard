@@ -229,7 +229,10 @@ class AnswerCapture {
                 ctx.textBaseline = 'top';
                 ctx.fillText('→ recognized:', x, y);
                 // Store the screen position so the HTML overlay can be placed.
+                // y+28: start position for the top-1 LaTeX, then additional rows below.
                 q._latexOverlayPos = { x, y: y + 28 };
+                // Store positions for the candidate list (top-3 with scores)
+                q._candidateOverlayPos = { x, y: y + 28 };
             }
         }
 

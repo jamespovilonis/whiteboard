@@ -196,7 +196,8 @@ class Whiteboard {
         this.updateLatexOverlays();
     }
 
-    // Update HTML overlays that show typeset LaTeX next to each recognized question.
+    // Update HTML overlays that show typeset LaTeX candidates.
+    // Renders a single fixed panel in the top-right corner with all candidates.
     updateLatexOverlays() {
         const container = this.canvas.parentElement;
         if (!container) return;
@@ -207,37 +208,76 @@ class Whiteboard {
             el.remove();
         }
 
+        // Find the active question (the one most recently recognized)
+        let activeQ = null;
         for (const q of this.answerCapture.questions) {
-            if (!q.recognizedLatex || !q._latexOverlayPos) continue;
-
-            // Compute screen position from virtual board coordinates
-            const screenX = q._latexOverlayPos.x - this.offsetX;
-            const screenY = q._latexOverlayPos.y - this.offsetY;
-
-            // Skip if off-screen
-            if (screenX < 0 || screenY < 0 ||
-                screenX > this.getViewportWidth() ||
-                screenY > this.getViewportHeight()) {
-                continue;
+            if (q.candidates && q.candidates.length > 0) {
+                activeQ = q;
             }
+        }
+        if (!activeQ) return;
 
-            const overlay = document.createElement('div');
-            overlay.className = 'latex-overlay';
-            overlay.style.left = `${screenX}px`;
-            overlay.style.top = `${screenY}px`;
-            container.appendChild(overlay);
+        const candidates = activeQ.candidates;
 
-            // Typeset with KaTeX if available; otherwise plain text fallback
-            if (typeof renderLatex === 'function') {
-                renderLatex(overlay, q.recognizedLatex);
-            } else if (typeof katex !== 'undefined') {
-                try {
-                    katex.render(q.recognizedLatex, overlay, { throwOnError: false, displayMode: false });
-                } catch (err) {
-                    overlay.textContent = q.recognizedLatex;
+        const panel = document.createElement('div');
+        panel.className = 'latex-overlay';
+        container.appendChild(panel);
+
+        // Render top-1 candidate with confidence score
+        const topRow = document.createElement('div');
+        topRow.className = 'latex-overlay-top';
+        topRow.style.cssText = 'display:flex;align-items:baseline;gap:8px;margin-bottom:4px;';
+        panel.appendChild(topRow);
+
+        const topLatex = document.createElement('span');
+        topLatex.className = 'latex-overlay-latex';
+        topRow.appendChild(topLatex);
+        if (typeof renderLatex === 'function') {
+            renderLatex(topLatex, candidates[0].latex);
+        } else if (typeof katex !== 'undefined') {
+            try {
+                katex.render(candidates[0].latex, topLatex, { throwOnError: false, displayMode: false });
+            } catch (err) {
+                topLatex.textContent = candidates[0].latex;
+            }
+        } else {
+            topLatex.textContent = candidates[0].latex;
+        }
+
+        const scoreSpan = document.createElement('span');
+        scoreSpan.className = 'latex-overlay-score';
+        scoreSpan.textContent = `(${candidates[0].score.toFixed(3)})`;
+        topRow.appendChild(scoreSpan);
+
+        // Render alternates (2nd through 10th) below the top choice
+        if (candidates.length > 1) {
+            for (let i = 1; i < candidates.length; i++) {
+                const cand = candidates[i];
+                if (!cand.latex) continue;
+
+                const altRow = document.createElement('div');
+                altRow.className = 'latex-overlay-alt';
+
+                const altLatex = document.createElement('span');
+                altRow.appendChild(altLatex);
+                if (typeof renderLatex === 'function') {
+                    renderLatex(altLatex, cand.latex);
+                } else if (typeof katex !== 'undefined') {
+                    try {
+                        katex.render(cand.latex, altLatex, { throwOnError: false, displayMode: false });
+                    } catch (err) {
+                        altLatex.textContent = cand.latex;
+                    }
+                } else {
+                    altLatex.textContent = cand.latex;
                 }
-            } else {
-                overlay.textContent = q.recognizedLatex;
+
+                const altScore = document.createElement('span');
+                altScore.className = 'latex-overlay-score-alt';
+                altScore.textContent = `(${cand.score.toFixed(3)})`;
+                altRow.appendChild(altScore);
+
+                panel.appendChild(altRow);
             }
         }
     }

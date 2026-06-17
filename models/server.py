@@ -172,16 +172,34 @@ async def recognize(file: UploadFile = File(...)):
     start = time.time()
     try:
         with torch.no_grad():
-            hyps = model.approximate_joint_search(img_tensor, mask)
+            candidates = model.approximate_joint_search_topk(img_tensor, mask, k=20)
     except Exception as exc:
         logger.exception("Model inference failed")
         raise HTTPException(status_code=500, detail=f"Inference failed: {exc}") from exc
     elapsed = time.time() - start
 
-    latex = vocab.indices2label(hyps[0].seq) if hyps else ""
-    logger.info(f"Recognized in {elapsed:.2f}s: {latex!r}")
+    # Build candidate list from top-k results (batch_size=1, so index 0).
+    # Deduplicate by LaTeX string — the bidirectional beam search often
+    # produces the same sequence via different beam paths. Keep only the
+    # best score for each unique LaTeX.
+    cand_list = []
+    seen = set()
+    for hyp in candidates[0]:
+        latex = vocab.indices2label(hyp.seq)
+        if latex in seen:
+            continue
+        seen.add(latex)
+        cand_list.append({
+            "latex": latex,
+            "score": round(hyp.score, 4),
+        })
+        if len(cand_list) >= 10:
+            break
 
-    return {"latex": latex}
+    top_latex = cand_list[0]["latex"] if cand_list else ""
+    logger.info(f"Recognized in {elapsed:.2f}s: {top_latex!r} (top-{len(cand_list)} unique)")
+
+    return {"candidates": cand_list, "top": cand_list[0] if cand_list else None}
 
 
 if __name__ == "__main__":
