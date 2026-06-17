@@ -1,1 +1,8 @@
 .DS_Store
+raster.png
+*.log
+models/model_weights
+models/CoMER-master/
+models/CoMER-master.zip
+models/.venv/
+models/server.log

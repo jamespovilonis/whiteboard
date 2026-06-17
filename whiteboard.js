@@ -1,16 +1,14 @@
+// Main whiteboard application logic: drawing, panning, tools, and answer capture integration.
+
 const TOOLS = { MOUSE: 'mouse', PEN: 'pen', ERASER: 'eraser' };
 const MAX_STROKES = 500;
-const SMOOTHING_STEPS = 12;        // subdivisions per segment (lower now since INTERP_STEP is small; 10–15 is enough for smoothness)
-const INTERP_STEP = 4;             // pixel spacing between stored points during live drawing (lower = more points, smoother curves)
-const TENSION = 0.1;              // Catmull-Rom tension: 0 = loose/round, 1 = tight/angular
-const VELOCITY_IMPACT = 0.40;     // ±20% width variation based on velocity (ink-like effect)
-const REF_SPEED = 50;             // reference speed in px per event for normalizing velocity in live drawing
+const INTERP_STEP = 4;             // pixel spacing between stored points during live drawing
 
 // ---- Standalone utility functions ----
 
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 
-function interpolatePoints(fromX, fromY, toX, toY, stepSize, rawVelocity = 0) {
+function interpolatePoints(fromX, fromY, toX, toY, stepSize) {
     const distance = Math.sqrt((toX - fromX) ** 2 + (toY - fromY) ** 2);
     const steps = Math.max(1, Math.ceil(distance / stepSize));
     const points = [];
@@ -19,173 +17,20 @@ function interpolatePoints(fromX, fromY, toX, toY, stepSize, rawVelocity = 0) {
         points.push({
             x: fromX + (toX - fromX) * t,
             y: fromY + (toY - fromY) * t,
-            velocity: rawVelocity,
         });
     }
     return points;
 }
 
-// Evaluate a Catmull-Rom spline segment between p1 and p2 at parameter t in [0,1].
-// Uses p0 and p3 as preceding/following control points for smooth tangent calculation.
-// Tension controls how tightly the curve hugs the control polygon.
-function catmullRomPoint(p0, p1, p2, p3, t, tension) {
-    const t2 = t * t;
-    const t3 = t2 * t;
-
-    const s = (1 - tension) / 2;
-
-    // Catmull-Rom basis matrix coefficients
-    const h1 =  2 * t3 - 3 * t2 + 1;
-    const h2 = -2 * t3 + 3 * t2;
-    const h3 =      t3 - 2 * t2 + t;
-    const h4 =      t3 -     t2;
-
-    return {
-        x: h1 * p1.x + h2 * p2.x + s * (h3 * (p2.x - p0.x) + h4 * (p3.x - p1.x)),
-        y: h1 * p1.y + h2 * p2.y + s * (h3 * (p2.y - p0.y) + h4 * (p3.y - p1.y)),
-    };
-}
-
-function getSplineControls(points, index) {
-    return {
-        p0: index === 0
-            ? { x: 2 * points[0].x - points[1].x, y: 2 * points[0].y - points[1].y, velocity: points[0].velocity }
-            : points[index - 1],
-        p1: points[index],
-        p2: points[index + 1],
-        p3: index >= points.length - 2
-            ? {
-                x: 2 * points[points.length - 1].x - points[points.length - 2].x,
-                y: 2 * points[points.length - 1].y - points[points.length - 2].y,
-                velocity: points[points.length - 1].velocity,
-            }
-            : points[index + 2],
-    };
-}
-
-function sampleSplinePoints(points, steps = SMOOTHING_STEPS) {
-    if (points.length < 2) return points.slice();
-
-    const samples = [{ ...points[0] }];
-    for (let i = 0; i < points.length - 1; i++) {
-        const { p0, p1, p2, p3 } = getSplineControls(points, i);
-        const v1 = p1.velocity !== undefined ? p1.velocity : 0;
-        const v2 = p2.velocity !== undefined ? p2.velocity : v1;
-
-        for (let step = 1; step <= steps; step++) {
-            const t = step / steps;
-            const pt = catmullRomPoint(p0, p1, p2, p3, t, TENSION);
-            samples.push({
-                x: pt.x,
-                y: pt.y,
-                velocity: v1 + (v2 - v1) * t,
-            });
-        }
-    }
-
-    return samples;
-}
-
-// Compute the velocity-normalized width multiplier for a given velocity.
-function velocityWidthMultiplier(velocity, minVel, maxVel, baseSize) {
-    const velRange = maxVel - minVel;
-    // Normalize: 0 = slowest (thickest), 1 = fastest (thinnest)
-    const normalized = velRange === 0 ? 0 : clamp((velocity - minVel) / velRange, 0, 1);
-    // Slow → +20%, fast → -20%
-    return baseSize * (1 + VELOCITY_IMPACT * (1 - normalized));
-}
-
-// Group consecutive spline-sample segments whose widths are within WIDTH_TOLERANCE
-// into a single continuous sub-path, avoiding the overlapping-round-cap pixelation
-// that occurs when every segment is stroked individually.
-const WIDTH_TOLERANCE = 0.4;       // if widths differ by less than this, they are drawn as one smooth sub-path
-
-// Render a Catmull-Rom spline with per-segment variable width based on velocity.
-// Each segment between adjacent points gets its own lineWidth computed from
-// the average velocity of its endpoints.
-function drawVariableWidthPath(ctx, points, baseSize) {
-    if (points.length < 2) return;
-
-    const smoothPoints = sampleSplinePoints(points);
-
-    // Find velocity range across the entire stroke
-    let minVel = Infinity, maxVel = -Infinity;
-    for (const p of smoothPoints) {
-        const v = p.velocity !== undefined ? p.velocity : 0;
-        if (v < minVel) minVel = v;
-        if (v > maxVel) maxVel = v;
-    }
-    // If no velocity data, fall back to uniform width
-    if (minVel === Infinity) {
-        ctx.lineWidth = baseSize;
-        ctx.beginPath();
-        ctx.moveTo(smoothPoints[0].x, smoothPoints[0].y);
-        for (let i = 1; i < smoothPoints.length; i++) {
-            ctx.lineTo(smoothPoints[i].x, smoothPoints[i].y);
-        }
-        ctx.stroke();
-        return;
-    }
-
-    // Precompute widths for every segment
-    const widths = [];
-    for (let i = 0; i < smoothPoints.length - 1; i++) {
-        const p1 = smoothPoints[i];
-        const p2 = smoothPoints[i + 1];
-        const avgVel = ((p1.velocity !== undefined ? p1.velocity : 0) +
-            (p2.velocity !== undefined ? p2.velocity : 0)) / 2;
-        widths.push(velocityWidthMultiplier(avgVel, minVel, maxVel, baseSize));
-    }
-
-    // Walk the segments, grouping consecutive segments whose widths are within tolerance.
-    // Each group becomes one `beginPath()` / `stroke()` call to avoid overlapping round caps.
-    let i = 0;
-    while (i < smoothPoints.length - 1) {
-        let j = i + 1;
-        // Extend the group while the width changes less than the tolerance
-        while (j < smoothPoints.length - 1 && Math.abs(widths[j] - widths[j - 1]) <= WIDTH_TOLERANCE) {
-            j++;
-        }
-        // Use the average width of the group
-        let sum = 0;
-        for (let k = i; k < j; k++) sum += widths[k];
-        ctx.lineWidth = sum / (j - i);
-
-        ctx.beginPath();
-        ctx.moveTo(smoothPoints[i].x, smoothPoints[i].y);
-        for (let k = i + 1; k <= j; k++) {
-            ctx.lineTo(smoothPoints[k].x, smoothPoints[k].y);
-        }
-        ctx.stroke();
-
-        i = j; // move to next group
-    }
-}
-
-// Render Catmull-Rom splines through a list of points.
-// Each adjacent pair of stored points becomes a cubic curve segment
-// that smoothly blends into the next with shared tangents.
+// Draw a polyline through a list of points using straight line segments.
 function drawCurvePath(ctx, points) {
     if (points.length < 2) return;
-    if (points.length === 2) {
-        ctx.beginPath();
-        ctx.moveTo(points[0].x, points[0].y);
-        ctx.lineTo(points[1].x, points[1].y);
-        ctx.stroke();
-        return;
-    }
 
     ctx.beginPath();
     ctx.moveTo(points[0].x, points[0].y);
 
-    for (let i = 0; i < points.length - 1; i++) {
-        const { p0, p1, p2, p3 } = getSplineControls(points, i);
-
-        for (let step = 1; step <= SMOOTHING_STEPS; step++) {
-            const t = step / SMOOTHING_STEPS;
-            const pt = catmullRomPoint(p0, p1, p2, p3, t, TENSION);
-            ctx.lineTo(pt.x, pt.y);
-        }
+    for (let i = 1; i < points.length; i++) {
+        ctx.lineTo(points[i].x, points[i].y);
     }
 
     ctx.stroke();
@@ -247,20 +92,11 @@ class Whiteboard {
         this.setCanvasSize();
         window.addEventListener('resize', () => this.setCanvasSize());
 
-        // ---- Questions / answer capture ----
-        this.questions = [];
-        this.nextQuestionId = 2; // q1 already exists, so next is q2
-        this.showCaptureBoxes = false; // press 'v' to toggle visual feedback
-        this.equationBank = [
-          '4x + 2 = 10',
-          '5x - 3 = 12',
-          '2x + 7 = 15',
-          '6x - 4 = 20',
-        ];
-        this.nextEquationIndex = 0;
+        // Answer capture system (questions, zones, stroke capture)
+        this.answerCapture = new AnswerCapture(this);
 
-        // Define the initial equations
-        this.initQuestions();
+        // Character capture system (groups strokes into individual characters)
+        this.characterCapture = new CharacterCapture(this);
 
         // Center the viewport on the board
         this.centerViewport();
@@ -271,183 +107,6 @@ class Whiteboard {
         // Event listeners
         this.setupEventListeners();
     }
-
-    // ---- Question / answer capture setup ----
-
-    initQuestions() {
-        this.questions = [
-            {
-                id: 'q1',
-                equation: '2x – 5 = 11',
-                textX: this.BOARD_WIDTH / 2 - 500,
-                textY: this.BOARD_HEIGHT / 2 - 400,
-                // Initial capture zone: generous rectangle under and to the right of the equation
-                zone: {
-                    x: this.BOARD_WIDTH / 2 - 500 - 250,
-                    y: this.BOARD_HEIGHT / 2 - 400 + 30,
-                    w: 800,
-                    h: 600,
-                },
-                // Dynamic bounding box — expands to contain all captured strokes
-                bbox: null, // { x1, y1, x2, y2 } or null
-                // Strokes that fall within this question's zone
-                strokes: [],
-                frozen: false, // false = still capturing, true = bbox is fixed (solved)
-            }
-        ];
-    }
-
-    // Check if a point falls within any question's capture zone OR within
-    // any question's dynamic bbox (with padding for chain growth).
-    // Returns the question object if found, or null.
-    findQuestionForPoint(vx, vy, padding = 200) {
-        for (const q of this.questions) {
-            // Check against the static zone first (if it still exists)
-            const z = q.zone;
-            if (z !== null && vx >= z.x && vx <= z.x + z.w && vy >= z.y && vy <= z.y + z.h) {
-                return q;
-            }
-            // Then check against the dynamic bbox (with padding) for chain growth
-            // Skip frozen bboxes — solved questions no longer expand
-            if (q.bbox && !q.frozen) {
-                const bx = q.bbox.x1 - padding;
-                const by = q.bbox.y1 - padding;
-                const bw = q.bbox.x2 - q.bbox.x1 + padding * 2;
-                const bh = q.bbox.y2 - q.bbox.y1 + padding * 2;
-                if (vx >= bx && vx <= bx + bw && vy >= by && vy <= by + bh) {
-                    return q;
-                }
-            }
-        }
-        return null;
-    }
-
-    // Expand a question's dynamic bounding box to include a stroke's points
-    expandBboxForStroke(q, stroke) {
-        for (const p of stroke.points) {
-            if (q.bbox === null) {
-                q.bbox = { x1: p.x, y1: p.y, x2: p.x, y2: p.y };
-            } else {
-                if (p.x < q.bbox.x1) q.bbox.x1 = p.x;
-                if (p.y < q.bbox.y1) q.bbox.y1 = p.y;
-                if (p.x > q.bbox.x2) q.bbox.x2 = p.x;
-                if (p.y > q.bbox.y2) q.bbox.y2 = p.y;
-            }
-        }
-    }
-
-    // Capture a finished stroke into any question whose zone or bbox it falls into
-    captureStroke(stroke) {
-        let capturedBy = new Set();
-        for (const p of stroke.points) {
-            const q = this.findQuestionForPoint(p.x, p.y);
-            if (q && !capturedBy.has(q.id)) {
-                capturedBy.add(q.id);
-                q.strokes.push(stroke);
-                stroke.questionId = q.id;
-                this.expandBboxForStroke(q, stroke);
-            }
-        }
-
-        // After capturing this stroke, the bbox may have grown.
-        // Re-check any previously uncaptured strokes to see if they now
-        // intersect the expanded bbox (chain growth / long solutions).
-        if (capturedBy.size > 0) {
-            this.recheckUncapturedStrokes();
-        }
-    }
-
-    // Iteratively scan uncaptured strokes — any that newly intersect an expanded
-    // bbox get captured, and the process repeats until no more captures occur.
-    recheckUncapturedStrokes() {
-        let changed = true;
-        while (changed) {
-            changed = false;
-            for (const stroke of this.strokes) {
-                if (stroke.questionId) continue;
-                for (const p of stroke.points) {
-                    const q = this.findQuestionForPoint(p.x, p.y);
-                    if (q) {
-                        q.strokes.push(stroke);
-                        stroke.questionId = q.id;
-                        this.expandBboxForStroke(q, stroke);
-                        changed = true;
-                        break; // move to next stroke
-                    }
-                }
-            }
-        }
-    }
-
-    // Remove a stroke from the question that holds it (e.g., when erased)
-    removeStrokeFromQuestions(stroke) {
-        if (!stroke.questionId) return;
-        const q = this.questions.find(q => q.id === stroke.questionId);
-        if (!q) return;
-        const idx = q.strokes.indexOf(stroke);
-        if (idx !== -1) {
-            q.strokes.splice(idx, 1);
-            // Recompute bbox from remaining strokes
-            q.bbox = null;
-            for (const s of q.strokes) {
-                this.expandBboxForStroke(q, s);
-            }
-        }
-    }
-
-    // Public method to retrieve captured strokes for a given question
-    getCapturedStrokes(questionId) {
-        const q = this.questions.find(q => q.id === questionId);
-        return q ? q.strokes : [];
-    }
-
-    // Add a new question below the previous question's captured writing (or equation text)
-    addNextQuestion() {
-        const lastQ = this.questions[this.questions.length - 1];
-        const id = 'q' + this.nextQuestionId;
-        this.nextQuestionId++;
-
-        // Determine vertical position:
-        // If the last question has written content (bbox), place the new equation
-        // below the bbox. Otherwise place it below the original equation text.
-        let newY;
-        if (lastQ.bbox) {
-            newY = lastQ.bbox.y2 + 150;
-        } else {
-            newY = lastQ.textY + 600;
-        }
-
-        const equation = this.equationBank[this.nextEquationIndex % this.equationBank.length];
-        this.nextEquationIndex++;
-
-        const newQ = {
-            id: id,
-            equation: equation,
-            textX: lastQ.textX,
-            textY: newY,
-            zone: {
-                x: lastQ.textX - 250,
-                y: newY + 30,
-                w: 800,
-                h: 600,
-            },
-            bbox: null,
-            strokes: [],
-            frozen: false,
-        };
-
-        // The previous question is now solved — freeze its bbox and clear the zone
-        lastQ.frozen = true;
-        if (lastQ.bbox) {
-            lastQ.zone = null;
-        }
-
-        this.questions.push(newQ);
-        this.renderAllStrokes();
-        console.log(`Added question "${id}": ${newQ.equation} at y=${newY}`);
-    }
-
-    // ---- End question capture ----
 
     get dpr() {
         return window.devicePixelRatio || 1;
@@ -519,57 +178,11 @@ class Whiteboard {
         // Draw grid
         this.drawGrid(ctx);
 
-        // Draw the question equations
-        ctx.fillStyle = '#444';
-        ctx.font = 'bold 56px "Segoe UI", "Helvetica Neue", Arial, sans-serif';
-        ctx.textAlign = 'center';
-        ctx.textBaseline = 'middle';
-        for (const q of this.questions) {
-            ctx.fillText(q.equation, q.textX, q.textY);
-        }
+        // Draw answer capture elements (equations, zone overlays)
+        this.answerCapture.render(ctx);
 
-        // Draw capture zone / bbox visual feedback (only when toggled on)
-        if (this.showCaptureBoxes) {
-            for (const q of this.questions) {
-                // Draw the initial capture zone as a light blue, semi-transparent box (if it exists)
-                if (q.zone !== null) {
-                    ctx.fillStyle = 'rgba(100, 150, 255, 0.08)';
-                    ctx.strokeStyle = 'rgba(100, 150, 255, 0.25)';
-                    ctx.lineWidth = 2;
-                    ctx.fillRect(q.zone.x, q.zone.y, q.zone.w, q.zone.h);
-                    ctx.strokeRect(q.zone.x, q.zone.y, q.zone.w, q.zone.h);
-                }
-
-                // Draw the dynamic bounding box that fits the captured strokes
-                if (q.bbox) {
-                    const bx = q.bbox.x1 - 15;
-                    const by = q.bbox.y1 - 15;
-                    const bw = q.bbox.x2 - q.bbox.x1 + 30;
-                    const bh = q.bbox.y2 - q.bbox.y1 + 30;
-                    ctx.fillStyle = 'rgba(76, 175, 80, 0.10)';
-                    ctx.strokeStyle = 'rgba(76, 175, 80, 0.6)';
-                    ctx.lineWidth = 3;
-                    ctx.fillRect(bx, by, bw, bh);
-                    ctx.strokeRect(bx, by, bw, bh);
-
-                    // Show stroke count
-                    ctx.fillStyle = 'rgba(76, 175, 80, 0.9)';
-                    ctx.font = 'bold 20px "Segoe UI", Arial, sans-serif';
-                    ctx.textAlign = 'left';
-                    ctx.textBaseline = 'bottom';
-                    ctx.fillText(`[${q.id}] ${q.strokes.length} stroke(s)`, bx, by - 5);
-                }
-
-                // If there are captured strokes but no bbox yet (edge case), show a label
-                if (!q.bbox && q.strokes.length > 0 && q.zone !== null) {
-                    ctx.fillStyle = 'rgba(76, 175, 80, 0.9)';
-                    ctx.font = 'bold 20px "Segoe UI", Arial, sans-serif';
-                    ctx.textAlign = 'left';
-                    ctx.textBaseline = 'bottom';
-                    ctx.fillText(`[${q.id}] ${q.strokes.length} stroke(s)`, q.zone.x, q.zone.y - 5);
-                }
-            }
-        }
+        // Draw character capture overlays (character bounding boxes)
+        this.characterCapture.render(ctx);
 
         // Replay all strokes
         for (const stroke of this.strokes) {
@@ -578,6 +191,55 @@ class Whiteboard {
 
         // Update visible viewport
         this.renderViewport();
+
+        // Update any typeset LaTeX overlays on top of the canvas
+        this.updateLatexOverlays();
+    }
+
+    // Update HTML overlays that show typeset LaTeX next to each recognized question.
+    updateLatexOverlays() {
+        const container = this.canvas.parentElement;
+        if (!container) return;
+
+        // Remove stale overlays
+        const existing = container.querySelectorAll('.latex-overlay');
+        for (const el of existing) {
+            el.remove();
+        }
+
+        for (const q of this.answerCapture.questions) {
+            if (!q.recognizedLatex || !q._latexOverlayPos) continue;
+
+            // Compute screen position from virtual board coordinates
+            const screenX = q._latexOverlayPos.x - this.offsetX;
+            const screenY = q._latexOverlayPos.y - this.offsetY;
+
+            // Skip if off-screen
+            if (screenX < 0 || screenY < 0 ||
+                screenX > this.getViewportWidth() ||
+                screenY > this.getViewportHeight()) {
+                continue;
+            }
+
+            const overlay = document.createElement('div');
+            overlay.className = 'latex-overlay';
+            overlay.style.left = `${screenX}px`;
+            overlay.style.top = `${screenY}px`;
+            container.appendChild(overlay);
+
+            // Typeset with KaTeX if available; otherwise plain text fallback
+            if (typeof renderLatex === 'function') {
+                renderLatex(overlay, q.recognizedLatex);
+            } else if (typeof katex !== 'undefined') {
+                try {
+                    katex.render(q.recognizedLatex, overlay, { throwOnError: false, displayMode: false });
+                } catch (err) {
+                    overlay.textContent = q.recognizedLatex;
+                }
+            } else {
+                overlay.textContent = q.recognizedLatex;
+            }
+        }
     }
 
     // Render a single stroke onto a given context
@@ -585,17 +247,12 @@ class Whiteboard {
         if (stroke.points.length === 0) return;
 
         ctx.strokeStyle = stroke.color;
+        ctx.lineWidth = stroke.size;
         ctx.lineCap = 'round';
         ctx.lineJoin = 'round';
         ctx.globalCompositeOperation = 'source-over';
 
-        // Use variable-width rendering for pen strokes that have velocity data
-        if (stroke.tool === TOOLS.PEN && stroke.points[0].velocity !== undefined) {
-            drawVariableWidthPath(ctx, stroke.points, stroke.size);
-        } else {
-            ctx.lineWidth = stroke.size;
-            drawCurvePath(ctx, stroke.points);
-        }
+        drawCurvePath(ctx, stroke.points);
     }
 
     // Copy the visible portion of the offscreen canvas to the viewport
@@ -675,16 +332,8 @@ class Whiteboard {
     drawPenStroke(fromX, fromY, toX, toY) {
         const ctx = this.offscreenCtx;
 
-        // Compute velocity (distance) for this segment
-        const distance = Math.sqrt((toX - fromX) ** 2 + (toY - fromY) ** 2);
-
-        // Live drawing: show velocity-based width immediately
-        // Reference speed centers the effect; slow = thicker, fast = thinner
-        const velFactor = clamp(1 - distance / REF_SPEED, 0, 1);
-        const liveWidth = this.currentSize * (1 + VELOCITY_IMPACT * velFactor);
-
         ctx.strokeStyle = this.currentColor;
-        ctx.lineWidth = liveWidth;
+        ctx.lineWidth = this.currentSize;
         ctx.lineCap = 'round';
         ctx.lineJoin = 'round';
         ctx.globalCompositeOperation = 'source-over';
@@ -693,8 +342,7 @@ class Whiteboard {
         ctx.lineTo(toX, toY);
         ctx.stroke();
 
-        // Store interpolated points with velocity data for later bezier rendering
-        const interpPoints = interpolatePoints(fromX, fromY, toX, toY, INTERP_STEP, distance);
+        const interpPoints = interpolatePoints(fromX, fromY, toX, toY, INTERP_STEP);
         for (const p of interpPoints) {
             this.currentStroke.points.push(p);
         }
@@ -719,7 +367,7 @@ class Whiteboard {
                 tool: this.currentTool,
                 color: this.currentColor,
                 size: this.currentSize,
-                points: [{ x: virtualPos.x, y: virtualPos.y, velocity: 0 }],
+                points: [{ x: virtualPos.x, y: virtualPos.y }],
             };
         }
     }
@@ -759,7 +407,9 @@ class Whiteboard {
                 for (const idx of toRemove) {
                     const removed = this.strokes[idx];
                     // Clean up question associations
-                    this.removeStrokeFromQuestions(removed);
+                    this.answerCapture.removeStrokeFromQuestions(removed);
+                    // Clean up character group associations
+                    this.characterCapture.removeStrokeFromCharacters(removed);
                     this.strokes.splice(idx, 1);
                 }
                 this.currentEraserHits.clear();
@@ -778,20 +428,22 @@ class Whiteboard {
             this.isDrawing = false;
             if (this.currentStroke.tool === TOOLS.ERASER) {
                 this.currentEraserHits.clear();
-                // Hit strokes were already removed during continueDrawing
             } else {
                 this.strokes.push(this.currentStroke);
                 // Capture this stroke into any question it belongs to
-                this.captureStroke(this.currentStroke);
+                this.answerCapture.captureStroke(this.currentStroke);
+                // Capture this stroke into any character group it belongs to
+                this.characterCapture.captureStroke(this.currentStroke);
                 // Enforce stroke limit — drop oldest strokes
                 while (this.strokes.length > MAX_STROKES) {
                     const oldest = this.strokes.shift();
-                    // If the oldest stroke was captured, remove it from questions too
-                    this.removeStrokeFromQuestions(oldest);
+                    // If the oldest stroke was captured, remove it from questions and characters too
+                    this.answerCapture.removeStrokeFromQuestions(oldest);
+                    this.characterCapture.removeStrokeFromCharacters(oldest);
                 }
 
                 // Replace the temporary live line-segment preview with the final
-                // spline-rendered stroke so jagged segments do not remain on the board.
+                // proper rendering so stray segments do not remain on the board.
                 this.renderAllStrokes();
             }
             this.currentStroke = null;
@@ -891,37 +543,23 @@ class Whiteboard {
             m: () => this.selectTool(TOOLS.MOUSE),
             p: () => this.selectTool(TOOLS.PEN),
             e: () => this.selectTool(TOOLS.ERASER),
-            v: () => { this.showCaptureBoxes = !this.showCaptureBoxes; this.renderAllStrokes(); },
-            d: () => this.dumpCaptureData(),
-            b: () => this.addNextQuestion(),
+            v: () => {
+                this.answerCapture.toggleCaptureBoxes();
+                this.characterCapture.toggleCaptureBoxes();
+            },
+            d: () => this.answerCapture.dumpCaptureData(),
+            b: () => this.answerCapture.addNextQuestion(),
+            r: () => generateRaster(this),
+            t: () => {
+                if (typeof recognizeActiveQuestion === 'function') {
+                    recognizeActiveQuestion(this);
+                }
+            },
         };
         document.addEventListener('keydown', (e) => {
             const action = KEY_ACTIONS[e.key.toLowerCase()];
             if (action) action();
         });
-    }
-
-    // Dump capture data to console for verification
-    dumpCaptureData() {
-        console.log('=== CAPTURE DATA ===');
-        for (const q of this.questions) {
-            console.log(`Question "${q.id}": ${q.equation}`);
-            console.log(`  Zone: ${q.zone ? `{ x: ${q.zone.x}, y: ${q.zone.y}, w: ${q.zone.w}, h: ${q.zone.h} }` : 'null (cleared)'}`);
-            console.log(`  Dynamic bbox: ${q.bbox ? JSON.stringify(q.bbox) : 'null'}`);
-            console.log(`  Captured strokes: ${q.strokes.length}`);
-            for (let i = 0; i < q.strokes.length; i++) {
-                const s = q.strokes[i];
-                console.log(`    Stroke ${i + 1}: ${s.points.length} points, color=${s.color}, size=${s.size}`);
-                // Log a few sample points to verify
-                if (s.points.length > 0) {
-                    const first = s.points[0];
-                    const last = s.points[s.points.length - 1];
-                    console.log(`      First: ({ x: ${first.x.toFixed(1)}, y: ${first.y.toFixed(1)} })`);
-                    console.log(`      Last:  ({ x: ${last.x.toFixed(1)}, y: ${last.y.toFixed(1)} })`);
-                }
-            }
-        }
-        console.log('====================');
     }
 
     selectTool(tool) {
